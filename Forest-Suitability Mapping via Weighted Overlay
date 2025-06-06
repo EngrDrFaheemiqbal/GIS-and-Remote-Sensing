@@ -1,0 +1,52 @@
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+
+# ---------- CONFIG ----------
+layers  = {
+    "rain.tif"  : 0.35,
+    "temp.tif"  : 0.25,
+    "soil.tif"  : 0.20,
+    "slope.tif" : 0.20
+}
+LANDMASK = "landmask.tif"      # 1=allowed, 0=exclude
+OUT_TIF  = "forest_suitability.tif"
+# -----------------------------
+
+# ---- 1. Read mask to get grid & profile ----
+with rasterio.open(LANDMASK) as msk_src:
+    mask = msk_src.read(1).astype("uint8")
+    prof = msk_src.profile.copy()
+
+suitability = np.zeros_like(mask, dtype="float32")
+
+# ---- 2. Weighted overlay ----
+for fname, w in layers.items():
+    print(f"Adding {fname}  (weight={w})")
+    with rasterio.open(fname) as src:
+        arr = src.read(1).astype("float32")
+        suitability += w * arr
+
+# ---- 3. Apply land-use mask ----
+suitability = np.where(mask == 1, suitability, np.nan)   # NaN = no-go zones
+
+# ---- 4. Save raster ----
+prof.update(count=1, dtype="float32", nodata=np.nan)
+with rasterio.open(OUT_TIF, "w", **prof) as dst:
+    dst.write(suitability, 1)
+
+print(f"Suitability map saved → {OUT_TIF}")
+
+# ---- 5. Optional classification ----
+classes = np.digitize(suitability, [0.33, 0.66])  # 0-1=Low, 2=Med, 3=High
+cmap = plt.cm.get_cmap("YlGn", 3)
+
+plt.figure(figsize=(9,7))
+plt.title("Forest Suitability Classes")
+plt.imshow(classes, cmap=cmap, vmin=0.5, vmax=3.5)
+cbar = plt.colorbar(ticks=[1,2,3], label="1=Low  2=Med  3=High")
+plt.axis("off")
+plt.tight_layout()
+plt.show()
