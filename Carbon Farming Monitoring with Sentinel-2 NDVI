@@ -1,0 +1,53 @@
+import os
+import glob
+import numpy as np
+import rasterio
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+from rasterio.mask import mask
+from datetime import datetime
+
+# ---------- CONFIG ----------
+NDVI_DIR = "./"                       # Path to folder with NDVI GeoTIFFs
+FARM_SHP = "farm_boundary.shp"        # Your farm boundary shapefile
+OUT_CSV  = "carbon_ndvi_summary.csv"  # Output CSV
+# -----------------------------
+
+# ---- 1. Load farm boundary ----
+print("Loading farm boundary...")
+farm = gpd.read_file(FARM_SHP)
+farm = farm.to_crs("EPSG:4326")  # Ensure CRS matches rasters
+
+# ---- 2. List and sort NDVI images ----
+ndvi_files = sorted(glob.glob(os.path.join(NDVI_DIR, "ndvi_*.tif")))
+dates = [datetime.strptime(os.path.basename(f)[5:12], "%Y_%m") for f in ndvi_files]
+
+ndvi_means = []
+
+# ---- 3. Loop through NDVI rasters ----
+print("Processing NDVI files...")
+for date, tif in zip(dates, ndvi_files):
+    with rasterio.open(tif) as src:
+        clipped, _ = mask(src, farm.geometry, crop=True)
+        ndvi = clipped[0].astype(np.float32)
+        ndvi[ndvi <= 0] = np.nan  # Remove invalid or nodata values
+
+        mean_val = np.nanmean(ndvi)
+        ndvi_means.append((date, mean_val))
+        print(f"{date.strftime('%Y-%m')} → Mean NDVI: {mean_val:.4f}")
+
+# ---- 4. Save to CSV ----
+df = pd.DataFrame(ndvi_means, columns=["Date", "Mean_NDVI"])
+df.to_csv(OUT_CSV, index=False)
+print(f"\n✅ NDVI time series saved to: {OUT_CSV}")
+
+# ---- 5. Plot NDVI trend ----
+plt.figure(figsize=(10,6))
+plt.plot(df["Date"], df["Mean_NDVI"], marker="o", linewidth=2, color="green")
+plt.title("NDVI Trend Over Time — Proxy for Aboveground Carbon")
+plt.xlabel("Date")
+plt.ylabel("Mean NDVI")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
