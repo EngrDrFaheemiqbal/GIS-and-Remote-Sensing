@@ -1,0 +1,155 @@
+import streamlit as st
+import geemap.foliumap as geemap
+import ee, datetime, pandas as pd, altair as alt
+st.set_page_config(page_title="Australian Forest Health Dashboard",
+                   page_icon="🌳", layout="wide")
+st.title("🌳 Australian Forest Health Dashboard")
+st.markdown("Draw or upload an **Area-of-Interest (AOI)**, choose the data you "
+            "want, then hit **Run** to see canopy height, soil carbon, and "
+            "tree-cover trends, all summarised in plain language.")
+
+if not ee.data._initialized:
+    ee.Initialize()
+
+with st.sidebar:
+    st.header("1️⃣  Select AOI")
+    up = st.file_uploader("Upload GeoJSON / Shapefile (.zip)", type=["geojson", "zip"])
+    year_range = st.slider("Tree-cover year range",
+                           1988, datetime.datetime.now().year,
+                           (2010, 2024))
+    st.header("2️⃣  Choose layers")
+    use_tree = st.checkbox("DEA Fractional Cover (tree %)", True)
+    use_height = st.checkbox("Canopy height (NASA JPL 2005)", True)
+    use_soc = st.checkbox("Top-soil organic carbon (SLGA)", True)
+    run = st.button("🚀 Run analysis")
+
+m = geemap.Map(center=[-25, 134], zoom=4, widescreen=True)
+draw = m.draw_control
+draw.rectangle, draw.polyline = False, False  # polygons only
+st.header("🗺️ Map – draw an AOI or zoom/pan")
+m.to_streamlit(width=700, height=480)
+
+
+aoi = None
+if up:                                                         # uploaded file
+    try:
+        aoi = geemap.load_geojson(up)
+        m.addLayer(aoi, {}, "AOI (upload)")
+        m.centerObject(aoi, 9)
+    except Exception as e:
+        st.error(f"Cannot read AOI: {e}")
+elif draw.last_draw:                                           # drawn polygon
+    aoi = ee.Geometry(draw.last_draw["geometry"])
+    m.addLayer(aoi, {"color": "red"}, "AOI (drawn)")
+
+
+fc_col = ee.ImageCollection("projects/ga/fc/v2/annual_mean")   # DEA tree % :contentReference[oaicite:0]{index=0}
+canopy = ee.Image("NASA/JPL/global_forest_canopy_height_2005") # canopy height  :contentReference[oaicite:1]{index=1}
+slga   = ee.ImageCollection("CSIRO/SLGA")                      # soil grid AU   :contentReference[oaicite:2]{index=2}
+soc_band = "SOC_000_005_EV"                                    # 0–5 cm layer
+
+
+def dea_tree_series(aoi, y0, y1):
+    rows = []
+    for yr in range(y0, y1 + 1):
+        img = fc_col.filter(ee.Filter.calendarRange(yr, yr, "year")).first()
+        if img:
+            mean = img.select("pv").reduceRegion(ee.Reducer.mean(), aoi, 30).get("pv")
+            rows.append({"Year": yr, "Tree_%": ee.Number(mean).getInfo()})
+    return pd.DataFrame(rows)
+
+def canopy_stats(aoi):
+    ch = canopy.select("1")   # height band is named "1"
+    stat = ch.reduceRegion(ee.Reducer.percentile([5,50,95]).combine(
+                           ee.Reducer.mean(), "", True), aoi, 30)
+    return {k: round(v, 2) for k, v in stat.getInfo().items()}
+
+def soc_mean(aoi):
+    img = slga.filter(ee.Filter.eq("system:index", "SOC")).first()
+    soc = img.select(soc_band)
+    return round(soc.reduceRegion(ee.Reducer.mean(), aoi, 90)
+                 .get(soc_band).getInfo(), 2)  # %
+
+if run:
+    if aoi is None:
+        st.warning("⚠️ Please draw or upload an AOI first.")
+        st.stop()
+
+    with st.spinner("Crunching numbers…"):
+
+        metrics = {}
+
+        if use_tree:
+            df = dea_tree_series(aoi, *year_range)
+            metrics["tree_start"], metrics["tree_end"] = df.iloc[0,1], df.iloc[-1,1]
+            m.addLayer(fc_col.filter(ee.Filter.calendarRange(year_range[1], year_range[1],"year"))
+                       .first().select("pv").clip(aoi),
+                       {"min":0,"max":100,"palette":["#f5f5dc","#228b22"]},
+                       f"DEA tree % {year_range[1]}")
+
+        if use_height:
+            h = canopy_stats(aoi)
+            metrics.update(h)
+            m.addLayer(canopy.clip(aoi),
+                       {"min":0,"max":40,"palette":["#ffffe5","#006400"]},
+                       "Canopy height (m)")
+
+        if use_soc:
+            soc = soc_mean(aoi)
+            metrics["soc"] = soc
+            img_soc = slga.filter(ee.Filter.eq("system:index", "SOC")).first().select(soc_band)
+            m.addLayer(img_soc.clip(aoi),
+                       {"min":0,"max":5,"palette":["#ffffcc","#800026"]},
+                       "Soil OC % (0-5 cm)")
+    st.subheader("📊 Results")
+    if use_tree:
+        st.write("**Annual tree-cover (% photosynthetic vegetation)**")
+        chart = alt.Chart(df).mark_line(point=True, color="#228b22").encode(
+                    x="Year:O", y="Tree_%:Q").properties(height=200)
+        st.altair_chart(chart, use_container_width=True)
+
+        delta = metrics["tree_end"] - metrics["tree_start"]
+        st.metric("Net change tree %", f"{delta:+.2f}",
+                  delta_color="normal" if abs(delta)<0.5 else
+                               ("inverse" if delta<0 else "normal"))
+
+    cols = st.columns(3)
+    if use_height:
+        with cols[0]:
+            st.metric("Median canopy height (m)", metrics["p50"], help="50th percentile")
+            st.caption(f"(5–95 % range {metrics['p5']} – {metrics['p95']} m)")
+    if use_soc:
+        with cols[1]:
+            st.metric("Mean top-soil OC %", metrics["soc"])
+
+     st.markdown("### 🧑‍🌾 Plain-language summary")
+    lines = []
+    if use_height:
+        if metrics["p50"] > 15:
+            lines.append("• **Trees are generally tall and mature** (>15 m median).")
+        elif metrics["p50"] > 5:
+            lines.append("• **Young/intermediate forest** (5–15 m median canopy).")
+        else:
+            lines.append("• **Low vegetation** (<5 m); likely regrowth or shrubland.")
+
+    if use_soc:
+        if metrics["soc"] >= 2.0:
+            lines.append("• **Healthy top-soil carbon** (≥ 2 %).")
+        elif metrics["soc"] >= 1.0:
+            lines.append("• Moderate soil carbon (1–2 %); good but could be improved.")
+        else:
+            lines.append("• **Low soil carbon** (< 1 %); consider soil-building practices.")
+
+    if use_tree:
+        trend = "increasing 📈" if delta>0.5 else "stable ➖" if abs(delta)<=0.5 else "decreasing 📉"
+        lines.append(f"• Tree-cover is **{trend}** over {year_range[0]}–{year_range[1]}.")
+
+    st.markdown("\n".join(lines) or "No layers selected.")
+
+    if use_tree:
+        st.download_button("💾 Download tree-cover CSV",
+                           df.to_csv(index=False).encode(),
+                           file_name="tree_cover_timeseries.csv",
+                           mime="text/csv")
+
+    st.success("Done! Zoom on the map to inspect layers; toggle in the map’s layer list.")
