@@ -1,0 +1,41 @@
+import os
+import rasterio
+from rasterio.merge import merge
+
+# Folder containing the raster files
+raster_folder = r"C:\Users\FIqbal\Downloads\CIBO0177-EvaDowns\Eva_down_TSDM"
+output_composite_path = os.path.join(raster_folder, r"C:\Users\FIqbal\Downloads\CIBO0177-EvaDowns\TSDM_composite.tif")
+
+# Find all raster files with the naming pattern '_TSDM15' in the folder
+raster_files = [os.path.join(raster_folder, f) for f in os.listdir(raster_folder) if f.endswith('_TSDM15.tif')]
+
+# Print the list of raster files found
+print(f"Raster files found: {raster_files}")
+
+# Check if there are exactly 10 raster files
+if len(raster_files) != 10:
+    print(f"Error: Expected 10 raster files, but found {len(raster_files)}. Please check the folder.")
+else:
+    # Read the rasters and merge them into a composite raster
+    src_files_to_mosaic = [rasterio.open(raster) for raster in raster_files]
+    
+    # Read metadata from the first raster file
+    meta = src_files_to_mosaic[0].meta.copy()
+    
+    # Update metadata to reflect the number of layers
+    meta.update(count=10)
+    
+    # Create an empty array to hold the composite bands
+    composite_array = []
+    
+    # Read each raster and append it as a band to the composite array
+    for i, src in enumerate(src_files_to_mosaic, start=1):
+        composite_array.append(src.read(1))
+        src.close()
+    
+    # Save the composite raster
+    with rasterio.open(output_composite_path, 'w', **meta) as dst:
+        for band_id, band in enumerate(composite_array, start=1):
+            dst.write(band, band_id)
+    
+    print(f"Composite raster created successfully at: {output_composite_path}")
