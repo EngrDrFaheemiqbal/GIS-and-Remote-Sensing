@@ -1,0 +1,42 @@
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.filters import threshold_otsu
+from tqdm import tqdm
+
+PRE_PATH  = "S1_pre.tif"
+POST_PATH = "S1_post.tif"
+OUT_MASK  = "flood_mask.tif"
+
+# ---- 1. Read rasters ----
+with rasterio.open(PRE_PATH) as pre_src, rasterio.open(POST_PATH) as post_src:
+    assert pre_src.shape == post_src.shape and pre_src.crs == post_src.crs
+    pre  = pre_src.read(1).astype("float32")   # dB
+    post = post_src.read(1).astype("float32")
+    prof = pre_src.profile.copy()
+
+# ---- 2. Compute backscatter change (pre - post) ----
+diff = pre - post          # Positive => backscatter dropped => water
+diff_mask = np.isfinite(diff)
+
+# ---- 3. Automatic Otsu threshold (on valid pixels only) ----
+thresh = threshold_otsu(diff[diff_mask])
+print(f"Otsu threshold: {thresh:.2f} dB")
+
+flood = (diff > thresh).astype("uint8")   # 1 = flood, 0 = non-flood
+flood[~diff_mask] = 0                     # set nodata to 0
+
+# ---- 4. Save mask ----
+prof.update(count=1, dtype="uint8", nodata=0)
+with rasterio.open(OUT_MASK, "w", **prof) as dst:
+    dst.write(flood, 1)
+
+print(f"Flood mask saved → {OUT_MASK}")
+
+# ---- 5. Quick-look ----
+plt.figure(figsize=(9,7))
+plt.title("Detected Flood Extent")
+plt.imshow(flood, cmap="Blues")
+plt.axis("off")
+plt.tight_layout()
+plt.show()
