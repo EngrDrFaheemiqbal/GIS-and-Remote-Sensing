@@ -4,76 +4,131 @@ import matplotlib.pyplot as plt
 from skimage.filters import threshold_otsu, gaussian
 from skimage.morphology import remove_small_objects, closing, square
 from skimage.feature import blob_log
+from skimage.filters.rank import variance
+from skimage.morphology import disk
 import geopandas as gpd
 from shapely.geometry import Point
 import folium
 from folium.plugins import MarkerCluster
+import warnings
+warnings.filterwarnings('ignore')
+NIR_BAND_PATH = "sentinel2_B8.tif"  # NIR band (Band 8)
+RED_BAND_PATH = "sentinel2_B4.tif"  # Red band (Band 4)
+MIN_OBJECT_SIZE = 100               # Minimum pixel size to keep objects
+GAUSSIAN_SIGMA = 2                 # NDVI smoothing sigma
+BLOB_MIN_SIGMA = 3                 # Min sigma for blob detection
+BLOB_MAX_SIGMA = 12                # Max sigma for blob detection
+BLOB_THRESHOLD = 0.18              # Threshold for blob detection sensitivity
+VARIANCE_FILTER_RADIUS = 5         # Radius for local variance texture filtering
+def load_band(path):
+    with rasterio.open(path) as src:
+        band = src.read(1).astype('float32')
+        profile = src.profile
+        transform = src.transform
+    print(f"Loaded {path} with shape {band.shape}")
+    return band, profile, transform
 
-# ----------- Load Sentinel-2 Bands -----------
-nir_path = "sentinel2_B8.tif"  # NIR
-red_path = "sentinel2_B4.tif"  # Red
+def calculate_ndvi(nir, red):
+    np.seterr(divide='ignore', invalid='ignore')
+    ndvi = (nir - red) / (nir + red + 1e-6)
+    ndvi = np.clip(ndvi, -1, 1)
+    print("NDVI calculated.")
+    return ndvi
+def smooth_and_threshold(ndvi, sigma, min_size):
+    ndvi_smoothed = gaussian(ndvi, sigma=sigma)
+    thresh = threshold_otsu(ndvi_smoothed)
+    ndvi_binary = ndvi_smoothed > thresh
+    print(f"Applied Otsu threshold at {thresh:.3f}")
+    ndvi_clean = remove_small_objects(ndvi_binary, min_size=min_size)
+    ndvi_closed = closing(ndvi_clean, square(3))
+    print(f"Removed small objects <{min_size} pixels and applied morphological closing.")
+    return ndvi_closed
 
-with rasterio.open(nir_path) as nir_src:
-    nir = nir_src.read(1).astype("float32")
-    profile = nir_src.profile
-    transform = nir_src.transform
+def add_texture_filter(ndvi_mask, radius):
+    ndvi_scaled = ((ndvi_mask.astype(float)) * 255).astype(np.uint8)
+    variance_img = variance(ndvi_scaled, disk(radius))
+    texture_mask = variance_img > np.percentile(variance_img, 60)
+    combined_mask = ndvi_mask & texture_mask
+    print(f"Applied texture-based filtering with radius {radius}.")
+    return combined_mask
+def detect_trees(mask, min_sigma, max_sigma, threshold):
+    blobs = blob_log(mask.astype(float), min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=10, threshold=threshold)
+    blobs[:, 2] = blobs[:, 2] * np.sqrt(2)  # Adjust radius
+    print(f"Detected {len(blobs)} potential trees using LoG.")
+    return blobs
 
-with rasterio.open(red_path) as red_src:
-    red = red_src.read(1).astype("float32")
+def blobs_to_geodataframe(blobs, transform, crs):
+    points = []
+    sizes = []
+    for y, x, r in blobs:
+        lon, lat = rasterio.transform.xy(transform, int(y), int(x))
+        points.append(Point(lon, lat))
+        sizes.append(r * 10)  # Approximate radius in meters (Sentinel-2 10m res)
+    gdf = gpd.GeoDataFrame({'geometry': points, 'radius_m': sizes}, crs=crs)
+    print("Converted blobs to GeoDataFrame.")
+    return gdf
 
-# ----------- NDVI Calculation -----------
-ndvi = (nir - red) / (nir + red + 1e-6)
-ndvi = np.clip(ndvi, -1, 1)
+def plot_results(ndvi, blobs):
+    fig, ax = plt.subplots(figsize=(12,10))
+    img = ax.imshow(ndvi, cmap='YlGn', vmin=0, vmax=1)
+    sizes = blobs[:, 2] * 30
+    ax.scatter(blobs[:, 1], blobs[:, 0], s=sizes, c='red', alpha=0.6, edgecolors='black', linewidths=0.5, label='Detected Trees')
+    plt.colorbar(img, ax=ax, label='NDVI')
+    ax.set_title("Tree Detection on Sentinel-2 NDVI")
+    ax.axis('off')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+def create_interactive_map(gdf):
+    mean_lat = gdf.geometry.y.mean()
+    mean_lon = gdf.geometry.x.mean()
+    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=15, tiles="Stamen Terrain")
 
-# ----------- Smooth & Threshold NDVI -----------
-ndvi_smooth = gaussian(ndvi, sigma=2)
-ndvi_thresh = ndvi_smooth > threshold_otsu(ndvi_smooth)
-ndvi_mask = remove_small_objects(ndvi_thresh, min_size=64)
-ndvi_mask = closing(ndvi_mask, square(3))
+    marker_cluster = MarkerCluster(name='Detected Trees').add_to(m)
+    for idx, row in gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=max(3, row.radius_m / 3),
+            color='green',
+            fill=True,
+            fill_color='green',
+            fill_opacity=0.6,
+            tooltip=f"Tree radius: {row.radius_m:.1f} m"
+        ).add_to(marker_cluster)
+    folium.LayerControl().add_to(m)
+    map_filename = "tree_detection_interactive_map.html"
+    m.save(map_filename)
+    print(f"Interactive map saved as {map_filename}")
+def main():
+    # Load bands
+    nir, profile, transform = load_band(NIR_BAND_PATH)
+    red, _, _ = load_band(RED_BAND_PATH)
 
-# ----------- Tree Top Detection via LoG -----------
-blobs = blob_log(ndvi_mask.astype(float), max_sigma=10, num_sigma=10, threshold=0.2)
-blobs[:, 2] = blobs[:, 2] * np.sqrt(2)  # Adjust radii
+    # Calculate NDVI
+    ndvi = calculate_ndvi(nir, red)
 
-# ----------- Convert to GeoPoints -----------
-tree_points = []
-for blob in blobs:
-    y, x, r = blob
-    lon, lat = rasterio.transform.xy(transform, int(y), int(x))
-    tree_points.append(Point(lon, lat))
+    # Smooth NDVI and threshold
+    ndvi_mask = smooth_and_threshold(ndvi, GAUSSIAN_SIGMA, MIN_OBJECT_SIZE)
 
-# ----------- Create GeoDataFrame -----------
-gdf = gpd.GeoDataFrame(geometry=tree_points, crs=profile["crs"])
-gdf["radius_m"] = blobs[:, 2] * 10  # Rough estimate (10m/pixel)
+    # Texture filter
+    ndvi_mask = add_texture_filter(ndvi_mask, VARIANCE_FILTER_RADIUS)
 
-# ----------- Save Outputs -----------
-gdf.to_file("detected_trees.shp")
-gdf.to_file("detected_trees.geojson", driver="GeoJSON")
+    # Detect blobs (trees)
+    blobs = detect_trees(ndvi_mask, BLOB_MIN_SIGMA, BLOB_MAX_SIGMA, BLOB_THRESHOLD)
 
-# ----------- Static Map Plot -----------
-fig, ax = plt.subplots(figsize=(10, 8))
-ndvi_display = ax.imshow(ndvi, cmap="YlGn", vmin=0, vmax=1)
-ax.scatter(blobs[:, 1], blobs[:, 0], color='red', s=10, label="Trees")
-plt.colorbar(ndvi_display, label="NDVI")
-plt.title("Detected Trees on NDVI")
-plt.legend()
-plt.axis('off')
-plt.tight_layout()
-plt.savefig("tree_detection_map.png", dpi=300)
-plt.show()
+    # Convert to GeoDataFrame
+    gdf = blobs_to_geodataframe(blobs, transform, profile['crs'])
 
-# ----------- Interactive Map with Folium -----------
-mean_lat = gdf.geometry.y.mean()
-mean_lon = gdf.geometry.x.mean()
-m = folium.Map(location=[mean_lat, mean_lon], zoom_start=15)
+    # Save outputs
+    gdf.to_file("detected_trees.shp")
+    gdf.to_file("detected_trees.geojson", driver='GeoJSON')
+    print("Saved detected trees shapefile and geojson.")
 
-marker_cluster = MarkerCluster().add_to(m)
-for pt in gdf.geometry:
-    folium.Marker(
-        location=[pt.y, pt.x],
-        icon=folium.Icon(color="green", icon="tree", prefix="fa"),
-        tooltip="Tree"
-    ).add_to(marker_cluster)
+    # Plot static results
+    plot_results(ndvi, blobs)
 
-m.save("tree_detection_map.html")
-print("✅ Process complete: Shapefile, GeoJSON, PNG & HTML map exported.")
+    # Create interactive map
+    create_interactive_map(gdf)
+
+if __name__ == "__main__":
+    main()
