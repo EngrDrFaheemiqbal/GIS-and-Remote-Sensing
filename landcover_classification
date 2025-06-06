@@ -1,0 +1,77 @@
+import rasterio
+import numpy as np
+import geopandas as gpd
+from rasterio.plot import show
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
+# ---------- STEP 1: Load Raster Data ----------
+raster_path = "sentinel2_image.tif"  # Multiband (RGB+NIR)
+raster = rasterio.open(raster_path)
+bands = raster.read()
+profile = raster.profile
+
+# Stack bands: shape (bands, rows, cols) -> (rows*cols, bands)
+rows, cols = raster.height, raster.width
+stacked = np.stack([bands[i] for i in range(bands.shape[0])], axis=0)
+reshaped = stacked.reshape(stacked.shape[0], -1).T  # shape: (pixels, bands)
+
+# ---------- STEP 2: Load Training Shapefile ----------
+train_shp = "training_data.shp"  # Must contain 'class' column
+train_gdf = gpd.read_file(train_shp)
+train_gdf = train_gdf.to_crs(raster.crs)
+
+# ---------- STEP 3: Extract Training Data ----------
+from rasterio.mask import mask
+from shapely.geometry import mapping
+from tqdm import tqdm
+
+X_train = []
+y_train = []
+
+print("Extracting training data from raster...")
+for _, row in tqdm(train_gdf.iterrows(), total=len(train_gdf)):
+    geom = [mapping(row.geometry)]
+    label = row['class']
+    
+    try:
+        out_image, _ = mask(raster, geom, crop=True)
+        pixels = out_image.reshape(out_image.shape[0], -1).T
+        pixels = pixels[~np.any(pixels == 0, axis=1)]  # remove no-data
+        X_train.append(pixels)
+        y_train.append(np.full(pixels.shape[0], label))
+    except:
+        continue
+
+X_train = np.vstack(X_train)
+y_train = np.concatenate(y_train)
+
+# ---------- STEP 4: Train Model ----------
+clf = RandomForestClassifier(n_estimators=100, random_state=42)
+clf.fit(X_train, y_train)
+
+# ---------- STEP 5: Predict Full Image ----------
+print("Predicting full image...")
+valid_mask = ~np.any(reshaped == 0, axis=1)
+X_valid = reshaped[valid_mask]
+y_pred = clf.predict(X_valid)
+
+# Create empty classified image
+classified = np.zeros((rows * cols), dtype=np.uint8)
+classified[valid_mask] = y_pred
+classified = classified.reshape((rows, cols))
+
+# ---------- STEP 6: Save and Visualize ----------
+output_path = "classified_map.tif"
+profile.update(count=1, dtype=rasterio.uint8)
+
+with rasterio.open(output_path, 'w', **profile) as dst:
+    dst.write(classified, 1)
+
+plt.figure(figsize=(10, 8))
+plt.title("Land Cover Classification")
+plt.imshow(classified, cmap='tab10')
+plt.colorbar(label='Class')
+plt.show()
