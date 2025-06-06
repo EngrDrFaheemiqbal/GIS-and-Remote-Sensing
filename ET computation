@@ -1,0 +1,101 @@
+import rasterio
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pyeto import fao56_penman_monteith, wind_speed_2m, \
+                  deg2rad, sol_dec, sunset_hour_angle, inv_rel_dist_earth_sun, \
+                  et_rad, mean_saturation_vapour_pressure, \
+                  actual_vapour_pressure_from_rhmin_rhmax, \
+                  slope_saturation_vapour_pressure_curve, psy_const
+
+# ----------------------- USER CONFIG -----------------------
+# Paths
+RED_PATH = "S2_B04.tif"     # Sentinel-2 Red band (B04)
+NIR_PATH = "S2_B08.tif"     # Sentinel-2 NIR band (B08)
+MET_CSV  = "met_data.csv"   # Daily met data
+
+# Choose which record in the CSV to use (by date or row idx)
+DATE = "2025-02-14"         # YYYY-MM-DD
+# -----------------------------------------------------------
+
+# ---------- 1. Read Sentinel-2 bands & compute NDVI ----------
+with rasterio.open(RED_PATH) as src_red, rasterio.open(NIR_PATH) as src_nir:
+    assert src_red.shape == src_nir.shape, "Bands not aligned!"
+    red = src_red.read(1).astype("float32")
+    nir = src_nir.read(1).astype("float32")
+    profile = src_red.profile.copy()
+
+ndvi = (nir - red) / (nir + red)
+ndvi = np.clip(ndvi, -1.0, 1.0)
+
+# ---------- 2. Convert NDVI to crop coefficient Kc ----------
+# Typical linear relationship (Allen et al., 2007; Chavez et al., 2009)
+# Modify a, b for your crop/region if you have field calibration.
+a, b = 1.25, 0.05
+kc = a * ndvi + b
+kc = np.clip(kc, 0.2, 1.2)   # Cap to reasonable bounds
+
+# ---------- 3. Load met data & calculate daily ETo ----------
+met_df = pd.read_csv(MET_CSV, parse_dates=["date"])
+met_row = met_df.loc[met_df["date"] == DATE]
+if met_row.empty:
+    raise ValueError(f"No weather record for {DATE} in {MET_CSV}")
+
+row = met_row.iloc[0]
+# Extract variables
+tmin, tmax = row["tmin"], row["tmax"]               # °C
+rh_min, rh_max = row["rh_min"], row["rh_max"]       # %
+u2 = wind_speed_2m(row["wind_m_s"])                 # m s-1 at 2 m
+rs = row["solar_MJ_m2"] * 1e6 / 86400              # convert MJ/m²→W/m² then to daily net rad
+z, lat = row["elev_m"], row["lat_deg"]
+
+# Julian day
+doy = row["date"].dayofyear
+phi = deg2rad(lat)                     # latitude [rad]
+delta = sol_dec(doy)                   # solar declination [rad]
+dr = inv_rel_dist_earth_sun(doy)       # inverse Earth–sun distance
+ws = sunset_hour_angle(phi, delta)     # sunset hour angle [rad]
+ra = et_rad(phi, delta, ws, dr)        # extraterrestrial rad [MJ m-2 day-1]
+
+# Mean air temp
+tmean = (tmax + tmin) / 2.0
+# Saturation vapour pressures
+es = mean_saturation_vapour_pressure(tmax, tmin)
+ea = actual_vapour_pressure_from_rhmin_rhmax(es, rh_min, rh_max)
+# Slope of vapour pressure curve & psychrometric constant
+delta_svp = slope_saturation_vapour_pressure_curve(tmean)
+psy = psy_const(101.3*((293-0.0065*z)/293)**5.26)   # kPa °C-1
+
+# Net radiation (simplified using measured Rs)
+rns = (1 - 0.23) * row["solar_MJ_m2"]               # net shortwave, MJ m-2 d-1
+# Clear-sky radiation (for cloudiness correction)
+rso = (0.75 + 2e-5 * z) * ra
+# Net longwave rad
+rl_term = (1.35 * (row["solar_MJ_m2"]/rso) - 0.35)
+rnl = 4.903e-9 * rl_term * (((tmax+273.16)**4 + (tmin+273.16)**4)/2) * (0.34 - 0.14*np.sqrt(ea))
+rn = rns - rnl                                  # MJ m-2 d-1
+
+# FAO-56 Penman-Monteith
+eto = fao56_penman_monteith(rn, tmean, u2, es, ea, delta_svp, psy)  # mm day-1
+print(f"Reference ET (ETo) on {DATE}: {eto:.2f} mm day⁻¹")
+
+# ---------- 4. Compute ETc map (mm/day) ----------
+etc = kc * eto
+etc = np.where(np.isfinite(etc), etc, profile["nodata"] or -9999)
+
+# ---------- 5. Save ET map ----------
+profile.update(count=1, dtype="float32", nodata=-9999)
+out_path = f"ETc_{DATE}.tif"
+with rasterio.open(out_path, "w", **profile) as dst:
+    dst.write(etc.astype("float32"), 1)
+
+print(f"Saved ETc raster → {out_path}")
+
+# ---------- 6. Quick-look plot ----------
+plt.figure(figsize=(10, 7))
+plt.title(f"Actual ET (mm/day) — {DATE}")
+plt.imshow(etc, cmap="viridis")
+plt.colorbar(label="mm day⁻¹")
+plt.axis("off")
+plt.tight_layout()
+plt.show()
