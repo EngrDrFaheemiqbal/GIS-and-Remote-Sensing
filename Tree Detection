@@ -1,0 +1,79 @@
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.filters import threshold_otsu, gaussian
+from skimage.morphology import remove_small_objects, closing, square
+from skimage.feature import blob_log
+import geopandas as gpd
+from shapely.geometry import Point
+import folium
+from folium.plugins import MarkerCluster
+
+# ----------- Load Sentinel-2 Bands -----------
+nir_path = "sentinel2_B8.tif"  # NIR
+red_path = "sentinel2_B4.tif"  # Red
+
+with rasterio.open(nir_path) as nir_src:
+    nir = nir_src.read(1).astype("float32")
+    profile = nir_src.profile
+    transform = nir_src.transform
+
+with rasterio.open(red_path) as red_src:
+    red = red_src.read(1).astype("float32")
+
+# ----------- NDVI Calculation -----------
+ndvi = (nir - red) / (nir + red + 1e-6)
+ndvi = np.clip(ndvi, -1, 1)
+
+# ----------- Smooth & Threshold NDVI -----------
+ndvi_smooth = gaussian(ndvi, sigma=2)
+ndvi_thresh = ndvi_smooth > threshold_otsu(ndvi_smooth)
+ndvi_mask = remove_small_objects(ndvi_thresh, min_size=64)
+ndvi_mask = closing(ndvi_mask, square(3))
+
+# ----------- Tree Top Detection via LoG -----------
+blobs = blob_log(ndvi_mask.astype(float), max_sigma=10, num_sigma=10, threshold=0.2)
+blobs[:, 2] = blobs[:, 2] * np.sqrt(2)  # Adjust radii
+
+# ----------- Convert to GeoPoints -----------
+tree_points = []
+for blob in blobs:
+    y, x, r = blob
+    lon, lat = rasterio.transform.xy(transform, int(y), int(x))
+    tree_points.append(Point(lon, lat))
+
+# ----------- Create GeoDataFrame -----------
+gdf = gpd.GeoDataFrame(geometry=tree_points, crs=profile["crs"])
+gdf["radius_m"] = blobs[:, 2] * 10  # Rough estimate (10m/pixel)
+
+# ----------- Save Outputs -----------
+gdf.to_file("detected_trees.shp")
+gdf.to_file("detected_trees.geojson", driver="GeoJSON")
+
+# ----------- Static Map Plot -----------
+fig, ax = plt.subplots(figsize=(10, 8))
+ndvi_display = ax.imshow(ndvi, cmap="YlGn", vmin=0, vmax=1)
+ax.scatter(blobs[:, 1], blobs[:, 0], color='red', s=10, label="Trees")
+plt.colorbar(ndvi_display, label="NDVI")
+plt.title("Detected Trees on NDVI")
+plt.legend()
+plt.axis('off')
+plt.tight_layout()
+plt.savefig("tree_detection_map.png", dpi=300)
+plt.show()
+
+# ----------- Interactive Map with Folium -----------
+mean_lat = gdf.geometry.y.mean()
+mean_lon = gdf.geometry.x.mean()
+m = folium.Map(location=[mean_lat, mean_lon], zoom_start=15)
+
+marker_cluster = MarkerCluster().add_to(m)
+for pt in gdf.geometry:
+    folium.Marker(
+        location=[pt.y, pt.x],
+        icon=folium.Icon(color="green", icon="tree", prefix="fa"),
+        tooltip="Tree"
+    ).add_to(marker_cluster)
+
+m.save("tree_detection_map.html")
+print("✅ Process complete: Shapefile, GeoJSON, PNG & HTML map exported.")
