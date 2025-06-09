@@ -1,0 +1,78 @@
+// Load Anthony area from Earth Engine asset
+var roi = ee.FeatureCollection('projects/ee-geosaptialaaco/assets/Anthony');
+Map.centerObject(roi, 10);
+
+// Filter Sentinel-2 SR Harmonized imagery over ROI and date range
+var sentinel = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterDate('2023-01-01', '2023-03-31')  // Adjust date range as needed
+  .filterBounds(roi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .map(function(img) {
+    // Scale reflectance bands
+    var bands = img.select('B.*').multiply(0.0001);
+    
+    // Calculate NDWI (Normalized Difference Water Index)
+    var ndwi = bands.normalizedDifference(['B3', 'B8']).rename('NDWI');
+    
+    // Calculate NDCI (Normalized Difference Chlorophyll Index)
+    var ndci = bands.normalizedDifference(['B5', 'B4']).rename('NDCI');
+    
+    // Return image with NDWI and NDCI bands added
+    return img.addBands(ndwi).addBands(ndci)
+              .copyProperties(img, ['system:time_start', 'system:time_end']);
+  });
+
+// Step 1: Separate lakes (water bodies) using mean NDWI over time
+var meanNdwi = sentinel.select('NDWI').mean().clip(roi);
+
+// Threshold NDWI > 0.1 to create a water mask
+var waterMask = meanNdwi.gt(0.1).selfMask();
+
+// Visualize lakes
+Map.addLayer(waterMask, {palette: ['0000FF']}, 'Detected Lakes (Water Mask)', true);
+
+// Convert water mask to vector polygons (lakes) with safer parameters
+var lakesVector = waterMask.reduceToVectors({
+  geometry: roi.geometry(),
+  scale: 100,          // Coarser scale to reduce pixel count
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'water',
+  maxPixels: 1e13,     // Increase maxPixels to allow large regions
+  bestEffort: true     // Allow Earth Engine to reduce scale if needed
+}).union(1);
+
+Map.addLayer(lakesVector, {color: 'blue'}, 'Lakes Vector', false);
+
+// Step 2: Calculate mean Chlorophyll (NDCI) over detected lakes area and time
+// Mask each image's NDCI band by waterMask
+var ndciMasked = sentinel.map(function(img) {
+  var ndci = img.select('NDCI');
+  var ndciWater = ndci.updateMask(waterMask);
+  return ndciWater.copyProperties(img, ['system:time_start']);
+});
+
+// Mean NDCI over time for lakes
+var meanNdci = ndciMasked.mean().clip(roi);
+
+// Visualize mean chlorophyll index inside lakes
+Map.addLayer(meanNdci, {min: -0.5, max: 0.5, palette: ['blue', 'white', 'green']}, 'Mean Chlorophyll (NDCI) in Lakes', true);
+
+// Export lakes vector to Drive (optional)
+Export.table.toDrive({
+  collection: lakesVector,
+  description: 'Anthony_Lakes_Vector',
+  folder: 'Anthony_Lakes',
+  fileFormat: 'SHP'
+});
+
+// Export mean NDCI image to Drive (optional)
+Export.image.toDrive({
+  image: meanNdci,
+  description: 'Anthony_Mean_NDCI_Lakes',
+  scale: 20,
+  region: roi.geometry(),
+  maxPixels: 1e13,
+  crs: 'EPSG:4326',
+  folder: 'Anthony_Lakes'
+});
