@@ -1,0 +1,98 @@
+// Load ROI from your asset
+var roi = ee.FeatureCollection('projects/ee-geosaptialaaco/assets/Anthony');
+Map.centerObject(roi);
+
+// Load MODIS MOD09Q1 collection and compute NDWI for 2001-2002
+var modis2001 = ee.ImageCollection("MODIS/061/MOD09Q1")
+  .select('sur_refl_b01', 'sur_refl_b02')
+  .filterDate('2001-01-01', '2002-12-31')
+  .map(function(img) {
+    var band = img.multiply(0.0001);
+    var ndwi = band.normalizedDifference(['sur_refl_b01', 'sur_refl_b02']).rename('ndwi');
+    return ndwi.copyProperties(img, img.propertyNames());
+  })
+  .median();
+
+Map.addLayer(modis2001.clip(roi.geometry()), {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'NDWI 2001', false);
+
+// Histogram of NDWI over ROI
+print(ui.Chart.image.histogram(modis2001, roi.geometry(), 250));
+
+// Threshold NDWI to detect water (> 0.1)
+var thr = modis2001.gt(0.1);
+Map.addLayer(thr.clip(roi.geometry()), {palette: ['0000FF']}, 'Water Threshold 2001', false);
+
+// Masked water layer
+var mask2001 = thr.updateMask(thr);
+Map.addLayer(mask2001.clip(roi.geometry()), {palette: ['0000FF']}, 'Masked Water 2001', false);
+
+// Convert water mask to vector polygons
+var vector2001 = mask2001.reduceToVectors({
+  geometry: roi.geometry(),
+  scale: 250,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'water',
+  bestEffort: true,
+  maxPixels: 1e13
+});
+Map.addLayer(vector2001, {color: '0000FF'}, 'Lake Vector 2001', false);
+
+// Load DEM from JAXA ALOS AW3D30
+var dem = ee.ImageCollection("JAXA/ALOS/AW3D30/V3_2")
+  .mean()
+  .select('DSM');
+Map.addLayer(dem.clip(roi.geometry()), {min: 0, max: 3000, palette: ['white', 'black']}, 'DEM', false);
+
+// Calculate 55th percentile elevation of lake area in 2001
+var lakeElevation2001 = dem.reduceRegion({
+  reducer: ee.Reducer.percentile([55]),
+  geometry: vector2001.geometry(),
+  scale: 250,
+  maxPixels: 1e13
+}).get('DSM');
+
+print('Lake elevation for 2001 (55th percentile):', lakeElevation2001);
+
+// Export lake boundary 2001 as shapefile to Drive
+Export.table.toDrive({
+  collection: vector2001,
+  description: 'lake2001',
+  folder: 'lake_border',
+  fileFormat: 'SHP'
+});
+
+// Repeat for 2023-2024 period
+var modis2023 = ee.ImageCollection("MODIS/061/MOD09Q1")
+  .select('sur_refl_b01', 'sur_refl_b02')
+  .filterDate('2023-01-01', '2024-12-31')
+  .map(function(img) {
+    var band = img.multiply(0.0001);
+    var ndwi = band.normalizedDifference(['sur_refl_b01', 'sur_refl_b02']).rename('ndwi');
+    return ndwi.copyProperties(img, img.propertyNames());
+  })
+  .median();
+
+var thr2023 = modis2023.gt(0.1);
+var mask2023 = thr2023.updateMask(thr2023);
+
+var vector2023 = mask2023.reduceToVectors({
+  geometry: roi.geometry(),
+  scale: 250,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'water',
+  bestEffort: true,
+  maxPixels: 1e13
+});
+
+Map.addLayer(vector2023, {color: '0000FF'}, 'Lake Vector 2023', false);
+
+var lakeElevation2023 = dem.reduceRegion({
+  reducer: ee.Reducer.percentile([55]),
+  geometry: vector2023.geometry(),
+  scale: 250,
+  maxPixels: 1e13
+}).get('DSM');
+
+print('Lake elevation for 2023 (55th percentile):', lakeElevation2023);
