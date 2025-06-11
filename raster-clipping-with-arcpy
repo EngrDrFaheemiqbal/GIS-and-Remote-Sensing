@@ -1,0 +1,39 @@
+import arcpy
+import os
+
+arcpy.env.workspace = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\Raster_data"
+
+input_folder = arcpy.env.workspace
+property_shp_path = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\AACO_Properties.shp"
+output_folder = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\Clipped_Layer"
+
+# Create output folder if it doesn't exist
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# List rasters with .tif extension
+raster_list = arcpy.ListRasters("*", "TIF")
+
+print(f"Found {len(raster_list)} raster(s): {raster_list}")
+
+for raster in raster_list:
+    print(f"Clipping raster: {raster}")
+
+    # Replace spaces and limit filename length to avoid issues
+    base_name = os.path.splitext(raster)[0]
+    safe_name = base_name.replace(" ", "_")[:13] + ".tif"  # max 13 chars base name + .tif extension
+
+    output_raster_path = os.path.join(output_folder, safe_name)
+
+    # Clip raster using the polygon boundary
+    arcpy.management.Clip(
+        in_raster=os.path.join(input_folder, raster),
+        rectangle="#",  # no rectangle, clip by geometry
+        out_raster=output_raster_path,
+        in_template_dataset=property_shp_path,
+        nodata_value="0",
+        clipping_geometry="ClippingGeometry",
+        maintain_clipping_extent="MAINTAIN_EXTENT"
+    )
+
+    print(f"Saved clipped raster to: {output_raster_path}")
