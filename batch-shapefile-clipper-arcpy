@@ -1,0 +1,32 @@
+import arcpy
+import os
+
+# Define paths
+property_shp_path = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\AACO_Properties.shp"
+input_folder = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\Data"
+output_folder = r"C:\Users\FIqbal\Downloads\Landscapesegmentation\Data of Land Segmentation\Clipped_Layer"
+
+# Make sure output folder exists
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# Set workspace to input folder
+arcpy.env.workspace = input_folder
+
+# List all shapefiles in input folder
+shapefiles = arcpy.ListFeatureClasses("*.shp")
+
+print(f"Found {len(shapefiles)} shapefiles to clip.")
+
+for shp in shapefiles:
+    input_shp = os.path.join(input_folder, shp)
+    output_shp = os.path.join(output_folder, f"clipped_{shp}")
+    
+    try:
+        print(f"Clipping {shp} ...")
+        arcpy.Clip_analysis(in_features=input_shp, clip_features=property_shp_path, out_feature_class=output_shp)
+        print(f"Saved clipped file: {output_shp}")
+    except Exception as e:
+        print(f"Failed to clip {shp}: {e}")
+
+print("Processing complete.")
